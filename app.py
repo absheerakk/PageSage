@@ -1,6 +1,7 @@
 import os
 import re
 import hashlib
+import logging
 import streamlit as st
 import chromadb
 import google.generativeai as genai
@@ -8,6 +9,16 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Configure logging format to match expected output structure
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# Cache app startup logging so it only outputs once on startup and not on every Streamlit rerun
+@st.cache_resource
+def log_startup():
+    logging.info("App started")
+
+log_startup()
 
 # Helper function to load API key supporting both local (.env) and Cloud (st.secrets) environments
 def get_api_key():
@@ -31,7 +42,6 @@ if api_key:
     genai.configure(api_key=api_key)
 
 # Define Hardened System Prompt
-# Added rule 5 to ensure responses are long enough to pass the output filter
 SYSTEM_PROMPT = """You are a helpful document Q&A assistant.
 
 CRITICAL RULES:
@@ -89,15 +99,14 @@ def contains_pii(text: str) -> list:
 def load_embed_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
-# Cache the Generative Model with Hardened System Prompt (reverted to gemini-2.5-flash)
+# Cache the Generative Model with Hardened System Prompt
 @st.cache_resource
 def load_llm():
-    # Double-check configuration within the load function
     k = get_api_key()
     if k:
         genai.configure(api_key=k)
     return genai.GenerativeModel(
-        model_name="gemini-2.5-flash-lite",
+        model_name="gemini-2.5-flash",
         system_instruction=SYSTEM_PROMPT,
     )
 
@@ -108,7 +117,7 @@ def load_scope_model():
     if k:
         genai.configure(api_key=k)
     return genai.GenerativeModel(
-        model_name="gemini-2.5-flash-lite",
+        model_name="gemini-2.5-flash",
         system_instruction=(
             "You are a scope checker for a document Q&A app.\n"
             "The user has uploaded a document and wants to ask questions about it.\n"
@@ -138,7 +147,9 @@ def is_in_scope(user_input: str, retrieved_context: str, scope_model) -> bool:
         response = scope_model.generate_content(prompt)
         result = response.text.strip().lower()
         return "in_scope" in result
-    except Exception:
+    except Exception as e:
+        # Log Gemini failure
+        logging.error(f"Gemini API call failed: {e}")
         return True
 
 # Output Filter Function
@@ -202,6 +213,8 @@ def build_collection(text, file_name, embed_model, force_reindex=False):
         ids = [f"c_{i}" for i in range(len(chunks))]
         collection.add(documents=chunks, embeddings=embeddings, ids=ids)
         chunk_count = len(chunks)
+        # Log successful indexing and chunk count
+        logging.info(f"Indexed {chunk_count} chunks from uploaded document")
         
     return collection, chunk_count
 
@@ -227,9 +240,15 @@ def ask(question, collection, embed_model, llm):
         # Apply output filter check
         is_clean, final_answer = check_output(raw_answer, question, SYSTEM_PROMPT)
         
+        if not is_clean:
+            # Log output leakage/injection detection as a block
+            logging.warning("Injection attempt blocked")
+            
         return final_answer, used_chunks
         
     except Exception as e:
+        # Log Gemini failure
+        logging.error(f"Gemini API call failed: {e}")
         st.error(f"API Error during generation: {e}")
         st.stop()
 
@@ -394,6 +413,8 @@ if submit_button:
                 in_scope = is_in_scope(question, retrieved_context, scope_model)
                 
             if not in_scope:
+                # Log when the injection/out-of-scope guard blocks an input
+                logging.warning("Injection attempt blocked")
                 st.error("I can only help with questions about the uploaded document.")
             else:
                 with st.spinner("Thinking..."):
